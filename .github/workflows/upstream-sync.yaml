@@ -1,0 +1,124 @@
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "37 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  propose-main:
+    runs-on: self-hosted
+    steps:
+      - name: Check out downstream main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: main
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/bluesky-social/indigo.git
+          git fetch --prune upstream main
+      - name: Create reviewed main update
+        id: merge
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          upstream_sha=$(git rev-parse upstream/main)
+          branch="automation/upstream-${upstream_sha:0:12}"
+          if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c "$branch"
+          git merge --no-ff upstream/main -m "Merge bluesky-social/indigo upstream main"
+          git push origin "HEAD:${branch}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+      - name: Open review-only main pull request
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          UPSTREAM_SHA: ${{ steps.merge.outputs.sha }}
+        run: |
+          gh pr create --base main --head "$BRANCH" \
+            --title "Sync bluesky-social/indigo ${UPSTREAM_SHA:0:12}" \
+            --body "Automated upstream merge proposal only. No auto-merge is configured.\n\nUpstream main: \`${UPSTREAM_SHA}\`\n\nMaintainer review and required checks are mandatory before merge."
+
+  propose-tap-hardening:
+    runs-on: self-hosted
+    steps:
+      - name: Check out candidate-safe Tap branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          ref: worklyn/tap-v0.1.10-hardening
+      - name: Fetch upstream Tap tags
+        run: |
+          git remote add upstream https://github.com/bluesky-social/indigo.git
+          git fetch --prune upstream '+refs/tags/tap-v*:refs/upstream-tags/tap-v*'
+      - name: Select latest verified Tap release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=""
+          while read -r ref; do
+            latest=$ref
+            break
+          done < <(git for-each-ref refs/upstream-tags/tap-v* --sort=-version:refname --format='%(refname)')
+          test -n "$latest"
+          tag=${latest#refs/upstream-tags/}
+          sha=$(git rev-parse "$latest^{commit}")
+          verified=$(gh api "repos/bluesky-social/indigo/commits/${sha}" --jq .commit.verification.verified)
+          test "$verified" = true
+          echo "ref=$latest" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Create reviewed Tap hardening update
+        id: merge
+        env:
+          RELEASE_REF: ${{ steps.release.outputs.ref }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          if git merge-base --is-ancestor "$RELEASE_SHA" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          branch="automation/tap-${RELEASE_TAG}"
+          if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c "$branch"
+          git merge --no-ff "$RELEASE_REF" -m "Merge bluesky-social/indigo ${RELEASE_TAG}"
+          git push origin "HEAD:${branch}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      - name: Open review-only Tap hardening pull request
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          gh pr create --base worklyn/tap-v0.1.10-hardening --head "$BRANCH" \
+            --title "Update candidate-safe Tap to ${RELEASE_TAG}" \
+            --body "Automated upstream Tap release proposal only. No auto-merge is configured.\n\nUpstream tag: \`${RELEASE_TAG}\`\nVerified commit: \`${RELEASE_SHA}\`\n\nMaintainer review must reconcile the candidate HTTP and webhook-DLQ patch, rerun adversarial and race tests, publish a new signed immutable image, and update the Social appliance lock before manual merge."
