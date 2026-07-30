@@ -22,6 +22,7 @@ import (
 type testEnvOpts struct {
 	outboxMode     OutboxMode
 	webhookURL     string
+	adminPassword  string
 	retryTimeout   time.Duration
 	eventCacheSize int
 }
@@ -79,6 +80,7 @@ func newTestEnv(t *testing.T, opts testEnvOpts) *testEnv {
 		OutboxParallelism: 1,
 		DisableAcks:       disableAcks,
 		WebhookURL:        webhookURL,
+		AdminPassword:     opts.adminPassword,
 		RetryTimeout:      retryTimeout,
 	}
 
@@ -101,7 +103,11 @@ func newTestEnv(t *testing.T, opts testEnvOpts) *testEnv {
 
 	// Start background goroutines
 	go events.LoadEvents(ctx)
-	go outbox.Run(ctx)
+	outboxDone := make(chan struct{})
+	go func() {
+		outbox.Run(ctx)
+		close(outboxDone)
+	}()
 
 	// Start HTTP server
 	go func() {
@@ -144,6 +150,11 @@ func newTestEnv(t *testing.T, opts testEnvOpts) *testEnv {
 	t.Cleanup(func() {
 		cancel()
 		server.Shutdown(context.Background())
+		select {
+		case <-outboxDone:
+		case <-time.After(2 * time.Second):
+			t.Errorf("outbox did not finish shutdown")
+		}
 		sqlDB, err := db.DB()
 		if err == nil {
 			sqlDB.Close()

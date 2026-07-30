@@ -1,13 +1,44 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/cmd/tap/models"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+type failingIdentityDirectory struct {
+	err error
+}
+
+func (d *failingIdentityDirectory) LookupHandle(context.Context, syntax.Handle) (*identity.Identity, error) {
+	return nil, d.err
+}
+
+func (d *failingIdentityDirectory) LookupDID(context.Context, syntax.DID) (*identity.Identity, error) {
+	return nil, d.err
+}
+
+func (d *failingIdentityDirectory) Lookup(context.Context, syntax.AtIdentifier) (*identity.Identity, error) {
+	return nil, d.err
+}
+
+func (d *failingIdentityDirectory) Purge(context.Context, syntax.AtIdentifier) error {
+	return nil
+}
 
 func newTestResyncer(te *testEnv) *Resyncer {
 	config := &TapConfig{
@@ -111,7 +142,7 @@ func TestHandleResyncError_WithError(t *testing.T) {
 	r := newTestResyncer(te)
 
 	did := "did:example:resync-err"
-	te.insertRepo(did, models.RepoStateActive, "3jzfcijpj2z2a", "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454", "alice.test")
+	te.insertRepo(did, models.RepoStateResyncing, "3jzfcijpj2z2a", "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454", "alice.test")
 
 	err := r.handleResyncError(te.ctx, did, fmt.Errorf("something went wrong"))
 	if err == nil || err.Error() != "something went wrong" {
@@ -142,7 +173,7 @@ func TestHandleResyncError_WithNilError(t *testing.T) {
 	r := newTestResyncer(te)
 
 	did := "did:example:resync-nil"
-	te.insertRepo(did, models.RepoStateActive, "3jzfcijpj2z2a", "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454", "")
+	te.insertRepo(did, models.RepoStateResyncing, "3jzfcijpj2z2a", "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454", "")
 
 	err := r.handleResyncError(te.ctx, did, nil)
 	if err != nil {
@@ -165,13 +196,12 @@ func TestHandleResyncError_ExponentialBackoff(t *testing.T) {
 	r := newTestResyncer(te)
 
 	did := "did:example:backoff"
-	te.insertRepo(did, models.RepoStateActive, "", "", "")
+	te.insertRepo(did, models.RepoStatePending, "", "", "")
 
 	var prevRetryAfter int64
 
 	for i := 0; i < 4; i++ {
-		// Reset state to active so GetRepoState works for handleResyncError
-		te.db.Model(&models.Repo{}).Where("did = ?", did).Update("state", models.RepoStateActive)
+		te.db.Model(&models.Repo{}).Where("did = ?", did).Update("state", models.RepoStateResyncing)
 
 		r.handleResyncError(te.ctx, did, fmt.Errorf("err"))
 
@@ -187,6 +217,194 @@ func TestHandleResyncError_ExponentialBackoff(t *testing.T) {
 		}
 		prevRetryAfter = repo.RetryAfter
 	}
+}
+
+func TestHandleResyncError_OversizeIsTerminal(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	r := newTestResyncer(te)
+
+	did := "did:example:oversized"
+	te.insertRepo(did, models.RepoStateResyncing, "", "", "")
+	limitErr := &HTTPBodyTooLargeError{Limit: 1024, Declared: 1025}
+
+	err := r.handleResyncError(te.ctx, did, fmt.Errorf("failed to get repo: %w", limitErr))
+	require.ErrorIs(t, err, limitErr)
+
+	var repo models.Repo
+	require.NoError(t, te.db.First(&repo, "did = ?", did).Error)
+	assert.Equal(t, models.RepoStateTerminal, repo.State)
+	assert.Zero(t, repo.RetryAfter)
+	assert.Equal(t, 1, repo.RetryCount)
+
+	_, found, err := r.claimResyncJob(te.ctx)
+	require.NoError(t, err)
+	assert.False(t, found, "terminal repos must not be retried")
+
+	require.NoError(t, deleteRepo(te.db, did))
+	te.insertRepo(did, models.RepoStatePending, "", "", "")
+	claimed, found, err := r.claimResyncJob(te.ctx)
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, did, claimed)
+}
+
+func TestHandleResyncErrorCannotOverwriteTerminalState(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	r := newTestResyncer(te)
+	did := "did:example:absorbing-terminal"
+	te.insertRepo(did, models.RepoStateTerminal, "", "", "")
+	require.NoError(t, te.db.Model(&models.Repo{}).Where("did = ?", did).Updates(map[string]interface{}{
+		"error_msg":   "poison identity",
+		"retry_count": 7,
+	}).Error)
+
+	resyncErr := errors.New("late resync failure")
+	err := r.handleResyncError(te.ctx, did, resyncErr)
+	require.ErrorIs(t, err, resyncErr)
+	require.ErrorIs(t, err, errResyncStateChanged)
+	var tracked models.Repo
+	require.NoError(t, te.db.First(&tracked, "did = ?", did).Error)
+	assert.Equal(t, models.RepoStateTerminal, tracked.State)
+	assert.Equal(t, "poison identity", tracked.ErrorMsg)
+	assert.Equal(t, 7, tracked.RetryCount)
+}
+
+func TestResyncDidOversizedIdentityIsTerminal(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	r := newTestResyncer(te)
+	did := "did:plc:wqgdnqlv2mwiio6pfchwtrff"
+	te.insertRepo(did, models.RepoStateResyncing, "", "", "")
+	limitErr := &HTTPBodyTooLargeError{Limit: 1024, Declared: -1}
+	te.repos.idDir = &failingIdentityDirectory{err: fmt.Errorf("identity response: %w", limitErr)}
+
+	err := r.resyncDid(te.ctx, did)
+	require.ErrorIs(t, err, limitErr)
+	var repo models.Repo
+	require.NoError(t, te.db.First(&repo, "did = ?", did).Error)
+	assert.Equal(t, models.RepoStateTerminal, repo.State)
+}
+
+func TestResyncDidOversizedCARIsTerminal(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	r := newTestResyncer(te)
+
+	docBytes, err := os.ReadFile("../../testing/testdata/greenground.didDoc.json")
+	require.NoError(t, err)
+	var doc identity.DIDDocument
+	require.NoError(t, json.Unmarshal(docBytes, &doc))
+	te.idDir.Insert(identity.ParseIdentity(&doc))
+	did := doc.DID.String()
+	te.insertRepo(did, models.RepoStateResyncing, "", "", "")
+	r.repoHTTPClient = newCandidateHTTPClientWithTransport(time.Second, 32, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: -1,
+			Body:          io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), 33))),
+			Request:       req,
+		}, nil
+	}))
+
+	err = r.resyncDid(te.ctx, did)
+	var limitErr *HTTPBodyTooLargeError
+	require.ErrorAs(t, err, &limitErr)
+	var repo models.Repo
+	require.NoError(t, te.db.First(&repo, "did = ?", did).Error)
+	assert.Equal(t, models.RepoStateTerminal, repo.State)
+}
+
+func TestDoResyncSignedCARStillVerifiesAndWalksMST(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	r := newTestResyncer(te)
+
+	docBytes, err := os.ReadFile("../../testing/testdata/greenground.didDoc.json")
+	require.NoError(t, err)
+	var doc identity.DIDDocument
+	require.NoError(t, json.Unmarshal(docBytes, &doc))
+	ident := identity.ParseIdentity(&doc)
+	te.idDir.Insert(ident)
+
+	carBytes, err := os.ReadFile("../../testing/testdata/greenground.repo.car")
+	require.NoError(t, err)
+	var requestCount int
+	r.repoMaxBytes = int64(len(carBytes))
+	r.repoMaxBlocks = defaultRepoMaxBlocks
+	r.repoTempDir = t.TempDir()
+	r.repoHTTPClient = newCandidateHTTPClientWithTransport(time.Second, int64(len(carBytes)), roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestCount++
+		assert.Equal(t, "https", req.URL.Scheme)
+		assert.Equal(t, "bsky.social", req.URL.Host)
+		assert.Equal(t, "/xrpc/com.atproto.sync.getRepo", req.URL.Path)
+		assert.Equal(t, userAgent(), req.Header.Get("User-Agent"))
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: int64(len(carBytes)),
+			Body:          io.NopCloser(bytes.NewReader(carBytes)),
+			Request:       req,
+		}, nil
+	}))
+
+	te.insertRepo(doc.DID.String(), models.RepoStateResyncing, "", "", "")
+	success, err := r.doResync(te.ctx, doc.DID.String())
+	require.NoError(t, err)
+	assert.True(t, success)
+	assert.Equal(t, 1, requestCount)
+
+	var repo models.Repo
+	require.NoError(t, te.db.First(&repo, "did = ?", doc.DID.String()).Error)
+	assert.Equal(t, models.RepoStateActive, repo.State)
+	assert.NotEmpty(t, repo.Rev)
+	assert.NotEmpty(t, repo.PrevData)
+	assertTempDirEmpty(t, r.repoTempDir)
+}
+
+func TestConcurrentTerminalStateWinsOverResyncSuccess(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	r := newTestResyncer(te)
+	ident, carBytes := loadRepoFixture(t)
+	te.idDir.Insert(ident)
+	did := ident.DID.String()
+	te.insertRepo(did, models.RepoStateResyncing, "", "", "")
+	r.repoHTTPClient = fixtureRepoClient(t, carBytes, int64(len(carBytes)), int64(len(carBytes)))
+	r.repoMaxBytes = int64(len(carBytes))
+	r.repoMaxBlocks = defaultRepoMaxBlocks
+	r.repoTempDir = t.TempDir()
+
+	activationStarted := make(chan struct{})
+	releaseActivation := make(chan struct{})
+	require.NoError(t, te.db.Callback().Update().Before("gorm:update").Register("test:block_resync_activation", func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]interface{})
+		if ok && fmt.Sprint(updates["state"]) == string(models.RepoStateActive) {
+			close(activationStarted)
+			<-releaseActivation
+		}
+	}))
+	defer te.db.Callback().Update().Remove("test:block_resync_activation")
+	type result struct {
+		success bool
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		success, err := r.doResync(te.ctx, did)
+		done <- result{success: success, err: err}
+	}()
+	select {
+	case <-activationStarted:
+	case res := <-done:
+		t.Fatalf("resync completed before activation hook: %v", res.err)
+	case <-time.After(time.Second):
+		t.Fatal("resync did not reach conditional activation")
+	}
+	terminalErr := errors.New("concurrent poison identity")
+	require.NoError(t, te.repos.MarkRepoTerminal(te.ctx, did, terminalErr))
+	close(releaseActivation)
+	res := <-done
+	assert.False(t, res.success)
+	require.ErrorIs(t, res.err, errResyncStateChanged)
+	var tracked models.Repo
+	require.NoError(t, te.db.First(&tracked, "did = ?", did).Error)
+	assert.Equal(t, models.RepoStateTerminal, tracked.State)
+	assert.Equal(t, terminalErr.Error(), tracked.ErrorMsg)
 }
 
 // --- resetPartiallyResynced tests ---
@@ -216,6 +434,23 @@ func TestResetPartiallyResynced(t *testing.T) {
 	}
 	if r3.State != models.RepoStateActive {
 		t.Fatalf("expected active repo unchanged, got %s", r3.State)
+	}
+}
+
+func TestResyncWorkersJoinPromptlyOnShutdown(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	r := newTestResyncer(te)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		r.run(ctx)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("resync workers did not join after cancellation")
 	}
 }
 

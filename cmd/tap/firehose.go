@@ -107,6 +107,9 @@ func (fp *FirehoseProcessor) ProcessCommit(ctx context.Context, evt *comatproto.
 
 	commit, err := fp.validateCommitAndFilterOps(ctx, evt)
 	if err != nil {
+		if isHTTPBodyTooLarge(err) {
+			return fp.terminalizeIdentityFailure(ctx, evt.Repo, err)
+		}
 		fp.logger.Error("failed to parse operations", "did", evt.Repo, "error", err)
 		return err
 	}
@@ -232,15 +235,17 @@ func (fp *FirehoseProcessor) ProcessSync(ctx context.Context, evt *comatproto.Sy
 		firehoseEventsSkipped.Inc()
 		return nil
 	}
-
-	commit, err := repo.VerifySyncMessage(ctx, fp.repos.idDir, evt)
-	if err != nil {
-		return fmt.Errorf("failed to verify sync message: %w", err)
-	}
-
 	if curr.State != models.RepoStateActive {
 		firehoseEventsSkipped.Inc()
 		return nil
+	}
+
+	commit, err := repo.VerifySyncMessage(ctx, fp.repos.idDir, evt)
+	if err != nil {
+		if isHTTPBodyTooLarge(err) {
+			return fp.terminalizeIdentityFailure(ctx, evt.Did, err)
+		}
+		return fmt.Errorf("failed to verify sync message: %w", err)
 	}
 
 	if curr.Rev != "" && commit.Rev <= curr.Rev {
@@ -282,12 +287,28 @@ func (fp *FirehoseProcessor) ProcessIdentity(ctx context.Context, evt *comatprot
 		firehoseEventsSkipped.Inc()
 		return nil
 	}
+	if curr.State == models.RepoStateTerminal {
+		firehoseEventsSkipped.Inc()
+		return nil
+	}
 
 	if err := fp.repos.RefreshIdentity(ctx, evt.Did); err != nil {
+		if isHTTPBodyTooLarge(err) {
+			return fp.terminalizeIdentityFailure(ctx, evt.Did, err)
+		}
 		return err
 	}
 
 	firehoseEventsProcessed.Inc()
+	return nil
+}
+
+func (fp *FirehoseProcessor) terminalizeIdentityFailure(ctx context.Context, did string, cause error) error {
+	if err := fp.repos.MarkRepoTerminal(ctx, did, cause); err != nil {
+		return fmt.Errorf("marking repo terminal after identity response exceeded limit: %w", err)
+	}
+	fp.logger.Error("repo moved to terminal state after oversized identity response", "did", did, "error", cause)
+	firehoseEventsSkipped.Inc()
 	return nil
 }
 

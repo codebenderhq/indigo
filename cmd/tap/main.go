@@ -66,7 +66,7 @@ func run(args []string) error {
 					},
 					&cli.StringFlag{
 						Name:    "plc-url",
-						Usage:   "PLC registry HTTP/HTTPS url",
+						Usage:   "pathless HTTPS origin for the PLC registry",
 						Value:   "https://plc.directory",
 						Sources: cli.EnvVars("TAP_PLC_URL", "ATP_PLC_HOST"),
 					},
@@ -84,8 +84,8 @@ func run(args []string) error {
 					},
 					&cli.IntFlag{
 						Name:    "resync-parallelism",
-						Usage:   "number of parallel resync workers",
-						Value:   5,
+						Usage:   "number of parallel resync workers (fixed at 1)",
+						Value:   1,
 						Sources: cli.EnvVars("TAP_RESYNC_PARALLELISM"),
 					},
 					&cli.IntFlag{
@@ -110,6 +110,24 @@ func run(args []string) error {
 						Usage:   "timeout when fetching repo CARs from PDS (e.g. 180s)",
 						Value:   300 * time.Second,
 						Sources: cli.EnvVars("TAP_REPO_FETCH_TIMEOUT"),
+					},
+					&cli.Int64Flag{
+						Name:    "identity-max-bytes",
+						Usage:   "maximum identity, DID, or PLC HTTP response size in bytes",
+						Value:   defaultIdentityMaxBytes,
+						Sources: cli.EnvVars("TAP_IDENTITY_MAX_BYTES"),
+					},
+					&cli.Int64Flag{
+						Name:    "repo-max-bytes",
+						Usage:   "maximum PDS repo CAR HTTP response size in bytes",
+						Value:   defaultRepoMaxBytes,
+						Sources: cli.EnvVars("TAP_REPO_MAX_BYTES"),
+					},
+					&cli.Int64Flag{
+						Name:    "repo-max-blocks",
+						Usage:   "maximum number of blocks in a PDS repo CAR",
+						Value:   defaultRepoMaxBlocks,
+						Sources: cli.EnvVars("TAP_REPO_MAX_BLOCKS"),
 					},
 					&cli.IntFlag{
 						Name:    "ident-cache-size",
@@ -194,10 +212,26 @@ func runTap(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("relay-url must start with http:// or https://")
 	}
 
-	// fail early if plc url is not http/https
-	plcUrl := cmd.String("plc-url")
-	if !strings.HasPrefix(plcUrl, "http://") && !strings.HasPrefix(plcUrl, "https://") {
-		return fmt.Errorf("plc-url must start with http:// or https://")
+	// Candidate identity resolution only permits a credential-free HTTPS origin.
+	plcUrl, err := canonicalCandidateOrigin(cmd.String("plc-url"))
+	if err != nil {
+		return fmt.Errorf("invalid plc-url: %w", err)
+	}
+
+	identityMaxBytes := cmd.Int64("identity-max-bytes")
+	if err := validateByteLimit("identity-max-bytes", identityMaxBytes, maxIdentityMaxBytes); err != nil {
+		return err
+	}
+	repoMaxBytes := cmd.Int64("repo-max-bytes")
+	if err := validateByteLimit("repo-max-bytes", repoMaxBytes, maxRepoMaxBytes); err != nil {
+		return err
+	}
+	repoMaxBlocks := cmd.Int64("repo-max-blocks")
+	if err := validateCountLimit("repo-max-blocks", repoMaxBlocks, maxRepoMaxBlocks); err != nil {
+		return err
+	}
+	if cmd.Int("resync-parallelism") != 1 {
+		return fmt.Errorf("resync-parallelism must be 1")
 	}
 
 	if cmd.Bool("no-replay") && cmd.Bool("full-network") {
@@ -215,6 +249,9 @@ func runTap(ctx context.Context, cmd *cli.Command) error {
 		FirehoseCursorSaveInterval: cmd.Duration("cursor-save-interval"),
 		NoReplay:                   cmd.Bool("no-replay"),
 		RepoFetchTimeout:           cmd.Duration("repo-fetch-timeout"),
+		IdentityMaxBytes:           identityMaxBytes,
+		RepoMaxBytes:               repoMaxBytes,
+		RepoMaxBlocks:              repoMaxBlocks,
 		IdentityCacheSize:          int(cmd.Int("ident-cache-size")),
 		EventCacheSize:             int(cmd.Int("outbox-capacity")),
 		FullNetworkMode:            cmd.Bool("full-network"),
@@ -232,9 +269,11 @@ func runTap(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
+	serviceCtx, cancelService := context.WithCancel(ctx)
+	defer cancelService()
 
 	if !config.OutboxOnly {
-		go tap.crawler.Run(ctx)
+		go tap.crawler.Run(serviceCtx)
 	}
 
 	svcErr := make(chan error, 1)
@@ -242,13 +281,17 @@ func runTap(ctx context.Context, cmd *cli.Command) error {
 	if !config.OutboxOnly {
 		go func() {
 			logger.Info("starting firehose consumer")
-			if err := tap.firehose.Run(ctx); err != nil {
+			if err := tap.firehose.Run(serviceCtx); err != nil {
 				svcErr <- err
 			}
 		}()
 	}
 
-	go tap.Run(ctx)
+	tapDone := make(chan struct{})
+	go func() {
+		tap.Run(serviceCtx)
+		close(tapDone)
+	}()
 
 	go func() {
 		logger.Info("starting HTTP server", "addr", cmd.String("bind"))
@@ -279,6 +322,7 @@ func runTap(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	logger.Info("shutting down")
+	cancelService()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -286,6 +330,11 @@ func runTap(ctx context.Context, cmd *cli.Command) error {
 	if err := tap.server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("error during shutdown", "error", err)
 		return err
+	}
+	select {
+	case <-tapDone:
+	case <-shutdownCtx.Done():
+		return fmt.Errorf("waiting for Tap workers to stop: %w", shutdownCtx.Err())
 	}
 
 	if err := tap.CloseDb(shutdownCtx); err != nil {

@@ -1,5 +1,7 @@
 package models
 
+import "time"
+
 type RepoState string
 
 const (
@@ -11,6 +13,7 @@ const (
 	RepoStateSuspended      RepoState = "suspended"
 	RepoStateDeactivated    RepoState = "deactivated"
 	RepoStateError          RepoState = "error"
+	RepoStateTerminal       RepoState = "terminal"
 )
 
 type AccountStatus string
@@ -36,10 +39,28 @@ type Repo struct {
 }
 
 type OutboxBuffer struct {
-	ID   uint   `gorm:"primaryKey"`
-	Did  string `gorm:"not null"`
-	Live bool   `gorm:"not null"`
-	Data string `gorm:"type:text;not null"` // JSON-encoded operations
+	ID         uint   `gorm:"primaryKey"`
+	Did        string `gorm:"not null"`
+	Live       bool   `gorm:"not null"`
+	Data       string `gorm:"type:text;not null"` // JSON-encoded operations
+	Generation uint64 `gorm:"not null;default:1"`
+}
+
+type OutboxDeadLetter struct {
+	ID                uint       `gorm:"primaryKey"`
+	OriginalEventID   uint       `gorm:"not null;uniqueIndex:idx_dead_letter_event_generation"`
+	Generation        uint64     `gorm:"not null;uniqueIndex:idx_dead_letter_event_generation"`
+	Did               string     `gorm:"not null;index"`
+	Live              bool       `gorm:"not null"`
+	Data              string     `gorm:"type:text;not null"`
+	SHA256            string     `gorm:"type:char(64);not null"`
+	PayloadBytes      int64      `gorm:"not null;default:0"`
+	Reason            string     `gorm:"type:text;not null"`
+	HTTPStatus        int        `gorm:"not null"`
+	DeadLetteredAt    time.Time  `gorm:"not null;index"`
+	Attempts          int        `gorm:"not null"`
+	RequeuedAt        *time.Time `gorm:"index"`
+	RequeueGeneration uint64     `gorm:"not null;default:0"`
 }
 
 type ResyncBuffer struct {

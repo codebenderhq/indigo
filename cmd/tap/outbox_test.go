@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bluesky-social/indigo/cmd/tap/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestFireAndForget_BasicDelivery(t *testing.T) {
@@ -305,4 +310,254 @@ func TestIdentityEvent_Delivery(t *testing.T) {
 	assert.Equal(t, "alice.bsky.social", msg.IdentityEvt.Handle)
 	assert.True(t, msg.IdentityEvt.IsActive)
 	assert.Equal(t, models.AccountStatusActive, msg.IdentityEvt.Status)
+}
+
+func TestGenerationAwareDispatchDeduplicatesExactEventAndAllowsLaterGeneration(t *testing.T) {
+	db := newDeadLetterTestDB(t)
+	config := &TapConfig{EventCacheSize: 10, OutboxParallelism: 1, DisableAcks: true, RetryTimeout: time.Minute}
+	events := newReadyEventManager(db, config)
+	outbox := NewOutbox(slog.Default(), events, config)
+	require.NoError(t, events.AddIdentityEvent(t.Context(), &IdentityEvt{
+		Did: "did:example:generation-dispatch", Status: models.AccountStatusActive,
+	}, func(*gorm.DB) error { return nil }))
+	first := <-outbox.outgoing
+	outbox.dispatchEvent(first)
+	outbox.dispatchEvent(first)
+	select {
+	case duplicate := <-outbox.outgoing:
+		t.Fatalf("exact generation was dispatched twice: %+v", duplicate)
+	case <-time.After(50 * time.Millisecond):
+	}
+	worker := outbox.workerFor(first.Did)
+	require.True(t, worker.ackEvent(first))
+	outbox.dispatchEvent(first)
+	select {
+	case duplicate := <-outbox.outgoing:
+		t.Fatalf("acknowledged exact generation was dispatched twice: %+v", duplicate)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	later := *first
+	later.Generation = 2
+	require.NoError(t, db.Model(&models.OutboxBuffer{}).Where("id = ? AND generation = ?", first.ID, first.Generation).Update("generation", later.Generation).Error)
+	events.cacheLk.Lock()
+	events.cache[first.ID] = &later
+	events.cacheLk.Unlock()
+	outbox.dispatchEvent(&later)
+	select {
+	case delivered := <-outbox.outgoing:
+		assert.Equal(t, uint64(2), delivered.Generation)
+	case <-time.After(time.Second):
+		t.Fatal("later generation was not dispatched after the prior generation completed")
+	}
+}
+
+func TestRequeuedLiveEventIsOrderedBeforeLaterSameDIDLiveEvent(t *testing.T) {
+	db := newDeadLetterTestDB(t)
+	config := &TapConfig{EventCacheSize: 10, OutboxParallelism: 1, DisableAcks: true, RetryTimeout: time.Minute}
+	events := newReadyEventManager(db, config)
+	outbox := NewOutbox(slog.Default(), events, config)
+	did := "did:example:requeue-order"
+	firstRecord := &RecordEvt{Did: did, Rev: "one", Collection: "app.example.test", Rkey: "one", Action: "create", Cid: "cid-one"}
+	require.NoError(t, events.AddRecordEvents(t.Context(), []*RecordEvt{firstRecord}, true, func(*gorm.DB) error { return nil }))
+	oldEvent := <-outbox.outgoing
+	require.NoError(t, outbox.DeadLetterEvent(t.Context(), oldEvent, payloadTooLargeReason, 413, 1))
+	var deadLetter models.OutboxDeadLetter
+	require.NoError(t, db.First(&deadLetter).Error)
+	requeued, err := outbox.RequeueDeadLetter(t.Context(), deadLetter.ID)
+	require.NoError(t, err)
+	secondRecord := &RecordEvt{Did: did, Rev: "two", Collection: "app.example.test", Rkey: "two", Action: "create", Cid: "cid-two"}
+	require.NoError(t, events.AddRecordEvents(t.Context(), []*RecordEvt{secondRecord}, true, func(*gorm.DB) error { return nil }))
+
+	select {
+	case delivered := <-outbox.outgoing:
+		assert.Equal(t, requeued.ID, delivered.ID)
+		assert.Equal(t, requeued.Generation, delivered.Generation)
+	case <-time.After(time.Second):
+		t.Fatal("requeued live event was not dispatched")
+	}
+	select {
+	case delivered := <-outbox.outgoing:
+		t.Fatalf("later live event overtook requeued barrier: %+v", delivered)
+	case <-time.After(50 * time.Millisecond):
+	}
+	outbox.AckWebhookEvent(requeued)
+	select {
+	case delivered := <-outbox.outgoing:
+		assert.NotEqual(t, requeued.ID, delivered.ID)
+	case <-time.After(time.Second):
+		t.Fatal("later live event did not resume after requeued event acknowledgement")
+	}
+}
+
+func TestRequeueWaitsForInitialEventLoad(t *testing.T) {
+	db := newDeadLetterTestDB(t)
+	data := `{"id":40}`
+	deadLetter := models.OutboxDeadLetter{
+		OriginalEventID: 40,
+		Generation:      1,
+		Did:             "did:example:startup-requeue",
+		Data:            data,
+		SHA256:          eventSHA256([]byte(data)),
+		PayloadBytes:    int64(len(data)),
+		Reason:          payloadTooLargeReason,
+		HTTPStatus:      413,
+		DeadLetteredAt:  time.Now(),
+	}
+	require.NoError(t, db.Create(&deadLetter).Error)
+	config := &TapConfig{EventCacheSize: 10, OutboxParallelism: 1, DisableAcks: true, RetryTimeout: time.Minute}
+	events := NewEventManager(slog.Default(), db, config)
+	outbox := NewOutbox(slog.Default(), events, config)
+	done := make(chan error, 1)
+	go func() {
+		_, err := outbox.RequeueDeadLetter(t.Context(), deadLetter.ID)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("requeue completed before initial load: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	events.LoadEvents(t.Context())
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("requeue did not resume after initial load")
+	}
+}
+
+func TestAckDeletionRetriesTransientAndAmbiguousFailures(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		configure func(*EventManager, *atomic.Int32)
+	}{
+		{
+			name: "transient before commit",
+			configure: func(events *EventManager, calls *atomic.Int32) {
+				events.beforeDeleteHook = func() error {
+					if calls.Add(1) == 1 {
+						return errors.New("transient delete failure")
+					}
+					return nil
+				}
+			},
+		},
+		{
+			name: "ambiguous after commit",
+			configure: func(events *EventManager, calls *atomic.Int32) {
+				events.afterDeleteCommitHook = func() error {
+					if calls.Add(1) == 1 {
+						return errors.New("ambiguous commit result")
+					}
+					return nil
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			db := newDeadLetterTestDB(t)
+			config := &TapConfig{EventCacheSize: 1, OutboxParallelism: 1, DisableAcks: true, RetryTimeout: time.Minute}
+			events := newReadyEventManager(db, config)
+			outbox := NewOutbox(slog.Default(), events, config)
+			outbox.deleteFlushInterval = 5 * time.Millisecond
+			outbox.deleteRetryBase = time.Millisecond
+			outbox.deleteRetryMax = 5 * time.Millisecond
+			var calls atomic.Int32
+			testCase.configure(events, &calls)
+			require.NoError(t, events.AddIdentityEvent(t.Context(), &IdentityEvt{
+				Did: "did:example:ack-delete", Status: models.AccountStatusActive,
+			}, func(*gorm.DB) error { return nil }))
+			evt := <-outbox.outgoing
+			ctx, cancel := context.WithCancel(t.Context())
+			runDone := make(chan struct{})
+			go func() {
+				outbox.Run(ctx)
+				close(runDone)
+			}()
+			outbox.AckEvent(evt.ID)
+
+			require.Eventually(t, func() bool {
+				var count int64
+				_ = db.Model(&models.OutboxBuffer{}).Where("id = ?", evt.ID).Count(&count).Error
+				_, cached := events.GetEvent(evt.ID)
+				return count == 0 && !cached
+			}, time.Second, 5*time.Millisecond)
+			assert.GreaterOrEqual(t, calls.Load(), int32(2))
+			assert.False(t, events.IsFull(), "successful retry must release cache capacity")
+			cancel()
+			select {
+			case <-runDone:
+			case <-time.After(time.Second):
+				t.Fatal("outbox delete worker did not stop")
+			}
+		})
+	}
+}
+
+func TestAckSubmissionWithSaturatedChannelPersistsWithoutBlocking(t *testing.T) {
+	db := newDeadLetterTestDB(t)
+	config := &TapConfig{EventCacheSize: 1, OutboxParallelism: 1, DisableAcks: true, RetryTimeout: time.Minute}
+	events := newReadyEventManager(db, config)
+	outbox := NewOutbox(slog.Default(), events, config)
+	outbox.acks = make(chan outboxAck, 1)
+	outbox.acks <- outboxAck{ID: 999, Generation: 1, Did: "did:example:dummy", SHA256: "dummy"}
+	require.NoError(t, events.AddIdentityEvent(t.Context(), &IdentityEvt{
+		Did: "did:example:saturated-ack", Status: models.AccountStatusActive,
+	}, func(*gorm.DB) error { return nil }))
+	evt := <-outbox.outgoing
+	done := make(chan struct{})
+	go func() {
+		outbox.AckEvent(evt.ID)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ack submission blocked on a full channel")
+	}
+	var count int64
+	require.NoError(t, db.Model(&models.OutboxBuffer{}).Where("id = ?", evt.ID).Count(&count).Error)
+	assert.Zero(t, count)
+	_, cached := events.GetEvent(evt.ID)
+	assert.False(t, cached)
+}
+
+func TestNewOutboxRejectsZeroParallelism(t *testing.T) {
+	db := newDeadLetterTestDB(t)
+	events := newReadyEventManager(db, &TapConfig{EventCacheSize: 1})
+	assert.PanicsWithError(t, "outbox-parallelism must be positive", func() {
+		NewOutbox(slog.Default(), events, &TapConfig{EventCacheSize: 1, OutboxParallelism: 0})
+	})
+}
+
+func TestOutboxShutdownDrainsQueuedAcknowledgements(t *testing.T) {
+	db := newDeadLetterTestDB(t)
+	config := &TapConfig{EventCacheSize: 1, OutboxParallelism: 1, DisableAcks: true, RetryTimeout: time.Minute}
+	events := newReadyEventManager(db, config)
+	outbox := NewOutbox(slog.Default(), events, config)
+	outbox.deleteFlushInterval = time.Hour
+	outbox.ackTimeout = time.Second
+	require.NoError(t, events.AddIdentityEvent(t.Context(), &IdentityEvt{
+		Did: "did:example:shutdown-ack", Status: models.AccountStatusActive,
+	}, func(*gorm.DB) error { return nil }))
+	evt := <-outbox.outgoing
+	outbox.AckEvent(evt.ID)
+	ctx, cancel := context.WithCancel(t.Context())
+	runDone := make(chan struct{})
+	go func() {
+		outbox.Run(ctx)
+		close(runDone)
+	}()
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("outbox shutdown did not drain acknowledgements")
+	}
+	var count int64
+	require.NoError(t, db.Model(&models.OutboxBuffer{}).Where("id = ?", evt.ID).Count(&count).Error)
+	assert.Zero(t, count)
+	_, cached := events.GetEvent(evt.ID)
+	assert.False(t, cached)
 }

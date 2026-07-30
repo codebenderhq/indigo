@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/identity"
+	repolib "github.com/bluesky-social/indigo/atproto/repo"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/cmd/tap/models"
+	"github.com/stretchr/testify/require"
 )
 
 func newTestFirehoseProcessor(te *testEnv, fullNetwork bool) *FirehoseProcessor {
@@ -436,6 +439,80 @@ func TestProcessIdentity_FullNetworkAutoTrack(t *testing.T) {
 	}
 	if repo.State != models.RepoStatePending {
 		t.Fatalf("expected state=pending, got %s", repo.State)
+	}
+}
+
+func TestProcessCommitOversizedIdentityMarksRepoTerminal(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	fp := newTestFirehoseProcessor(te, false)
+	_, carBytes := loadRepoFixture(t)
+	commit, _, err := repolib.LoadCommitFromCAR(te.ctx, bytes.NewReader(carBytes))
+	require.NoError(t, err)
+	te.insertRepo(commit.DID, models.RepoStateActive, "", "", "")
+	limitErr := &HTTPBodyTooLargeError{Limit: 1024, Declared: 1025}
+	te.repos.idDir = &failingIdentityDirectory{err: limitErr}
+
+	err = fp.ProcessCommit(te.ctx, &comatproto.SyncSubscribeRepos_Commit{
+		Blocks: carBytes,
+		Repo:   commit.DID,
+		Rev:    commit.Rev,
+		Seq:    101,
+	})
+	require.NoError(t, err)
+	assertFirehoseRepoTerminal(t, te, fp, commit.DID, 101)
+}
+
+func TestProcessSyncOversizedIdentityMarksRepoTerminal(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	fp := newTestFirehoseProcessor(te, false)
+	_, carBytes := loadRepoFixture(t)
+	commit, _, err := repolib.LoadCommitFromCAR(te.ctx, bytes.NewReader(carBytes))
+	require.NoError(t, err)
+	te.insertRepo(commit.DID, models.RepoStateActive, "", "", "")
+	te.repos.idDir = &failingIdentityDirectory{err: &HTTPBodyTooLargeError{Limit: 1024, Declared: -1}}
+
+	err = fp.ProcessSync(te.ctx, &comatproto.SyncSubscribeRepos_Sync{
+		Blocks: carBytes,
+		Did:    commit.DID,
+		Rev:    commit.Rev,
+		Seq:    102,
+	})
+	require.NoError(t, err)
+	assertFirehoseRepoTerminal(t, te, fp, commit.DID, 102)
+}
+
+func TestProcessIdentityOversizedResponseMarksRepoTerminalAndRemoveAddRecovers(t *testing.T) {
+	te := newTestEnv(t, testEnvOpts{})
+	fp := newTestFirehoseProcessor(te, false)
+	did := "did:plc:wqgdnqlv2mwiio6pfchwtrff"
+	te.insertRepo(did, models.RepoStateActive, "", "", "")
+	te.repos.idDir = &failingIdentityDirectory{err: &HTTPBodyTooLargeError{Limit: 1024, Declared: 1025}}
+
+	err := fp.ProcessIdentity(te.ctx, &comatproto.SyncSubscribeRepos_Identity{Did: did, Seq: 103})
+	require.NoError(t, err)
+	assertFirehoseRepoTerminal(t, te, fp, did, 103)
+
+	require.NoError(t, deleteRepo(te.db, did))
+	te.insertRepo(did, models.RepoStatePending, "", "", "")
+	var recovered models.Repo
+	require.NoError(t, te.db.First(&recovered, "did = ?", did).Error)
+	if recovered.State != models.RepoStatePending {
+		t.Fatalf("expected remove/add recovery to restore pending state, got %s", recovered.State)
+	}
+}
+
+func assertFirehoseRepoTerminal(t *testing.T, te *testEnv, fp *FirehoseProcessor, did string, seq int64) {
+	t.Helper()
+	var tracked models.Repo
+	require.NoError(t, te.db.First(&tracked, "did = ?", did).Error)
+	if tracked.State != models.RepoStateTerminal {
+		t.Fatalf("expected terminal repo state, got %s", tracked.State)
+	}
+	if tracked.ErrorMsg == "" {
+		t.Fatal("expected terminal identity error to be recorded")
+	}
+	if fp.lastSeq.Load() != seq {
+		t.Fatalf("expected poison event cursor %d to advance, got %d", seq, fp.lastSeq.Load())
 	}
 }
 

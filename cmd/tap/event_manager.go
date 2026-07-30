@@ -25,16 +25,62 @@ type EventManager struct {
 	cache   map[uint]*OutboxEvt
 	cacheLk sync.RWMutex
 
-	pendingIDs chan uint
+	dispatchLk sync.Mutex
+	dispatch   func(*OutboxEvt)
+	backlog    []*OutboxEvt
+
+	initialLoadDone chan struct{}
+	loadDoneOnce    sync.Once
+
+	beforeDeleteHook       func() error
+	afterDeleteCommitHook  func() error
+	afterRequeueCommitHook func() error
 }
 
 func NewEventManager(logger *slog.Logger, db *gorm.DB, config *TapConfig) *EventManager {
 	return &EventManager{
-		logger:     logger.With("component", "event_manager"),
-		db:         db,
-		cacheSize:  config.EventCacheSize,
-		cache:      make(map[uint]*OutboxEvt),
-		pendingIDs: make(chan uint, config.EventCacheSize*2), // give us some buffer room in channel since we can overshoot
+		logger:          logger.With("component", "event_manager"),
+		db:              db,
+		cacheSize:       config.EventCacheSize,
+		cache:           make(map[uint]*OutboxEvt),
+		initialLoadDone: make(chan struct{}),
+	}
+}
+
+func (em *EventManager) SetDispatcher(dispatch func(*OutboxEvt)) {
+	em.dispatchLk.Lock()
+	em.dispatch = dispatch
+	backlog := em.backlog
+	em.backlog = nil
+	em.dispatchLk.Unlock()
+	for _, evt := range backlog {
+		dispatch(evt)
+	}
+}
+
+func (em *EventManager) dispatchEvent(evt *OutboxEvt) {
+	em.dispatchLk.Lock()
+	if em.dispatch == nil {
+		em.backlog = append(em.backlog, evt)
+		em.dispatchLk.Unlock()
+		return
+	}
+	dispatch := em.dispatch
+	em.dispatchLk.Unlock()
+	dispatch(evt)
+}
+
+func (em *EventManager) markInitialLoadDone() {
+	em.finishedLoading.Store(true)
+	em.loadDoneOnce.Do(func() { close(em.initialLoadDone) })
+}
+
+func (em *EventManager) WaitForInitialLoad(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-em.initialLoadDone:
+		return nil
 	}
 }
 
@@ -75,19 +121,42 @@ func (em *EventManager) GetEvent(id uint) (*OutboxEvt, bool) {
 	return evt, exists
 }
 
-func (em *EventManager) DeleteEvents(ctx context.Context, ids []uint) error {
-	if len(ids) == 0 {
+func (em *EventManager) DeleteEvents(ctx context.Context, acks []outboxAck) error {
+	if len(acks) == 0 {
 		return nil
 	}
+	if em.beforeDeleteHook != nil {
+		if err := em.beforeDeleteHook(); err != nil {
+			return err
+		}
+	}
 
-	if err := em.db.WithContext(ctx).Delete(&models.OutboxBuffer{}, ids).Error; err != nil {
+	byGeneration := make(map[uint64][]uint)
+	for _, ack := range acks {
+		byGeneration[ack.Generation] = append(byGeneration[ack.Generation], ack.ID)
+	}
+	if err := em.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for generation, ids := range byGeneration {
+			if err := tx.Where("generation = ? AND id IN ?", generation, ids).Delete(&models.OutboxBuffer{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return err
+	}
+	if em.afterDeleteCommitHook != nil {
+		if err := em.afterDeleteCommitHook(); err != nil {
+			return err
+		}
 	}
 
 	em.cacheLk.Lock()
 	defer em.cacheLk.Unlock()
-	for _, id := range ids {
-		delete(em.cache, id)
+	for _, ack := range acks {
+		if evt, ok := em.cache[ack.ID]; ok && evt.Generation == ack.Generation {
+			delete(em.cache, ack.ID)
+		}
 	}
 	eventCacheSize.Set(float64(len(em.cache)))
 	return nil
@@ -112,7 +181,12 @@ func (em *EventManager) LoadEvents(ctx context.Context) {
 				continue
 			}
 			if lastPageID == lastID {
-				em.finishedLoading.Store(true)
+				if err := em.reserveDeadLetterIDs(ctx); err != nil {
+					em.logger.Error("failed to reserve dead-letter event IDs", "error", err)
+					time.Sleep(500 * time.Millisecond)
+					continue
+				}
+				em.markInitialLoadDone()
 				return
 			}
 			lastID = lastPageID
@@ -139,10 +213,11 @@ func (em *EventManager) loadEventPage(ctx context.Context, lastID int) (int, err
 	em.cacheLk.Lock()
 	for i := range dbEvts {
 		entry := &OutboxEvt{
-			ID:    dbEvts[i].ID,
-			Did:   dbEvts[i].Did,
-			Live:  dbEvts[i].Live,
-			Event: []byte(dbEvts[i].Data),
+			ID:         dbEvts[i].ID,
+			Did:        dbEvts[i].Did,
+			Live:       dbEvts[i].Live,
+			Event:      []byte(dbEvts[i].Data),
+			Generation: dbEvts[i].Generation,
 		}
 		em.cache[entry.ID] = entry
 	}
@@ -150,13 +225,35 @@ func (em *EventManager) loadEventPage(ctx context.Context, lastID int) (int, err
 	em.cacheLk.Unlock()
 
 	maxID := dbEvts[len(dbEvts)-1].ID
-	em.nextID.Store(uint64(maxID + 1))
+	em.advanceNextID(maxID)
 
 	for i := range dbEvts {
-		em.pendingIDs <- dbEvts[i].ID
+		evt, ok := em.GetEvent(dbEvts[i].ID)
+		if ok {
+			em.dispatchEvent(evt)
+		}
 	}
 
 	return int(dbEvts[resultSize-1].ID), nil
+}
+
+func (em *EventManager) reserveDeadLetterIDs(ctx context.Context) error {
+	var maxID uint
+	if err := em.db.WithContext(ctx).Model(&models.OutboxDeadLetter{}).
+		Select("COALESCE(MAX(original_event_id), 0)").Scan(&maxID).Error; err != nil {
+		return err
+	}
+	em.advanceNextID(maxID)
+	return nil
+}
+
+func (em *EventManager) advanceNextID(id uint) {
+	for {
+		current := em.nextID.Load()
+		if current >= uint64(id) || em.nextID.CompareAndSwap(current, uint64(id)) {
+			return
+		}
+	}
 }
 
 func (em *EventManager) AddCommit(ctx context.Context, commit *Commit, dbCallback DBCallback) error {
@@ -230,17 +327,19 @@ func (em *EventManager) AddRecordEvents(ctx context.Context, evts []*RecordEvt, 
 		}
 
 		dbEvts = append(dbEvts, &models.OutboxBuffer{
-			ID:   evtID,
-			Did:  evt.Did,
-			Live: live,
-			Data: string(jsonData),
+			ID:         evtID,
+			Did:        evt.Did,
+			Live:       live,
+			Data:       string(jsonData),
+			Generation: 1,
 		})
 
 		cacheEvts[evtID] = OutboxEvt{
-			ID:    evtID,
-			Did:   evt.Did,
-			Live:  live,
-			Event: jsonData,
+			ID:         evtID,
+			Did:        evt.Did,
+			Live:       live,
+			Event:      jsonData,
+			Generation: 1,
 		}
 	}
 
@@ -287,7 +386,9 @@ func (em *EventManager) AddRecordEvents(ctx context.Context, evts []*RecordEvt, 
 	em.cacheLk.Unlock()
 
 	for _, evtID := range evtIDs {
-		em.pendingIDs <- evtID
+		if evt, ok := em.GetEvent(evtID); ok {
+			em.dispatchEvent(evt)
+		}
 	}
 
 	return nil
@@ -305,26 +406,29 @@ func (em *EventManager) AddIdentityEvent(ctx context.Context, evt *IdentityEvt, 
 			return err
 		}
 		return tx.Create(&models.OutboxBuffer{
-			ID:   evtID,
-			Did:  evt.Did,
-			Live: false,
-			Data: string(jsonData),
+			ID:         evtID,
+			Did:        evt.Did,
+			Live:       false,
+			Data:       string(jsonData),
+			Generation: 1,
 		}).Error
 	}); err != nil {
 		return err
 	}
 
-	em.cacheLk.Lock()
-	em.cache[evtID] = &OutboxEvt{
-		ID:    evtID,
-		Did:   evt.Did,
-		Live:  false,
-		Event: jsonData,
+	entry := &OutboxEvt{
+		ID:         evtID,
+		Did:        evt.Did,
+		Live:       false,
+		Event:      jsonData,
+		Generation: 1,
 	}
+	em.cacheLk.Lock()
+	em.cache[evtID] = entry
 	eventCacheSize.Set(float64(len(em.cache)))
 	em.cacheLk.Unlock()
 
-	em.pendingIDs <- evtID
+	em.dispatchEvent(entry)
 
 	return nil
 }
