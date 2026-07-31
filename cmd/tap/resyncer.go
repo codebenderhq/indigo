@@ -1,17 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
-	comatproto "github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/atproto/atclient"
 	"github.com/bluesky-social/indigo/atproto/atdata"
 	repolib "github.com/bluesky-social/indigo/atproto/repo"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -20,6 +18,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"gorm.io/gorm"
 )
+
+var errResyncStateChanged = errors.New("repo is no longer resyncing")
 
 type Resyncer struct {
 	logger *slog.Logger
@@ -30,7 +30,10 @@ type Resyncer struct {
 
 	claimJobMu sync.Mutex
 
-	repoFetchTimeout  time.Duration
+	repoHTTPClient    *http.Client
+	repoMaxBytes      int64
+	repoMaxBlocks     int64
+	repoTempDir       string
 	collectionFilters []string
 	parallelism       int
 
@@ -39,22 +42,42 @@ type Resyncer struct {
 }
 
 func NewResyncer(logger *slog.Logger, db *gorm.DB, repos *RepoManager, events *EventManager, config *TapConfig) *Resyncer {
+	timeout := config.RepoFetchTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	maxBytes := config.RepoMaxBytes
+	if maxBytes == 0 {
+		maxBytes = defaultRepoMaxBytes
+	}
+	maxBlocks := config.RepoMaxBlocks
+	if maxBlocks == 0 {
+		maxBlocks = defaultRepoMaxBlocks
+	}
 	return &Resyncer{
 		logger:            logger.With("component", "resyncer"),
 		db:                db,
 		events:            events,
 		repos:             repos,
-		repoFetchTimeout:  config.RepoFetchTimeout,
+		repoHTTPClient:    newCandidateHTTPClient(timeout, maxBytes),
+		repoMaxBytes:      maxBytes,
+		repoMaxBlocks:     maxBlocks,
 		collectionFilters: config.CollectionFilters,
-		parallelism:       config.ResyncParallelism,
+		parallelism:       1,
 		pdsBackoff:        make(map[string]time.Time),
 	}
 }
 
 func (r *Resyncer) run(ctx context.Context) {
+	var workers sync.WaitGroup
 	for i := 0; i < r.parallelism; i++ {
-		go r.runResyncWorker(ctx, i)
+		workers.Add(1)
+		go func(workerID int) {
+			defer workers.Done()
+			r.runResyncWorker(ctx, workerID)
+		}(i)
 	}
+	workers.Wait()
 }
 
 func (r *Resyncer) runResyncWorker(ctx context.Context, workerID int) {
@@ -76,12 +99,16 @@ func (r *Resyncer) runResyncWorker(ctx context.Context, workerID int) {
 			did, found, err := r.claimResyncJob(ctx)
 			if err != nil {
 				logger.Error("failed to claim resync job", "error", err)
-				time.Sleep(time.Second)
+				if !sleepContext(ctx, time.Second) {
+					return
+				}
 				continue
 			}
 
 			if !found {
-				time.Sleep(time.Second)
+				if !sleepContext(ctx, time.Second) {
+					return
+				}
 				continue
 			}
 
@@ -148,6 +175,11 @@ func (r *Resyncer) resyncDid(ctx context.Context, did string) error {
 	err := r.repos.RefreshIdentity(ctx, did)
 	if err != nil {
 		r.logger.Info("failed to refresh identity", "did", did, "error", err)
+		if isHTTPBodyTooLarge(err) {
+			resyncsFailed.Inc()
+			resyncDuration.Observe(time.Since(startTime).Seconds())
+			return r.handleResyncError(ctx, did, err)
+		}
 	}
 
 	success, err := r.doResync(ctx, did)
@@ -179,9 +211,9 @@ func (r *Resyncer) doResync(ctx context.Context, did string) (bool, error) {
 		return false, fmt.Errorf("failed to resolve DID: %w", err)
 	}
 
-	pdsURL := ident.PDSEndpoint()
-	if pdsURL == "" {
-		return false, fmt.Errorf("no PDS endpoint for DID: %s", did)
+	pdsURL, err := candidatePDSEndpoint(ident)
+	if err != nil {
+		return false, err
 	}
 
 	signingKey, err := ident.PublicKey()
@@ -198,17 +230,7 @@ func (r *Resyncer) doResync(ctx context.Context, did string) (bool, error) {
 
 	r.logger.Info("fetching repo from PDS", "did", did, "pds", pdsURL)
 
-	client := atclient.NewAPIClient(pdsURL)
-	client.Headers.Set("User-Agent", userAgent())
-	timeout := r.repoFetchTimeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	client.Client = &http.Client{
-		Timeout: timeout,
-	}
-
-	repoBytes, err := comatproto.SyncGetRepo(ctx, client, did, "")
+	repoFile, repoSize, err := r.fetchRepoCAR(ctx, pdsURL, did)
 	if err != nil {
 		if isRateLimitError(err) {
 			r.pdsBackoffMu.Lock()
@@ -218,10 +240,19 @@ func (r *Resyncer) doResync(ctx context.Context, did string) (bool, error) {
 		}
 		return false, fmt.Errorf("failed to get repo: %w", err)
 	}
+	defer func() {
+		if err := cleanupRepoFile(repoFile); err != nil {
+			r.logger.Error("failed to close repo temp file", "did", did, "error", err)
+		}
+	}()
 
-	r.logger.Info("parsing repo CAR", "did", did, "size", len(repoBytes))
+	blocks, err := preflightCARBlocks(ctx, repoFile, r.repoMaxBlocks)
+	if err != nil {
+		return false, fmt.Errorf("failed CAR preflight: %w", err)
+	}
+	r.logger.Info("parsing repo CAR", "did", did, "size", repoSize, "blocks", blocks)
 
-	commit, repo, err := repolib.LoadRepoFromCAR(ctx, bytes.NewReader(repoBytes))
+	commit, repo, err := repolib.LoadRepoFromCAR(ctx, &contextReader{ctx: ctx, reader: repoFile})
 	if err != nil {
 		return false, fmt.Errorf("failed to read repo from CAR: %w", err)
 	}
@@ -330,8 +361,8 @@ func (r *Resyncer) doResync(ctx context.Context, did string) (bool, error) {
 		return false, fmt.Errorf("failed to flush final batch: %w", err)
 	}
 
-	if err := r.db.WithContext(ctx).Model(&models.Repo{}).
-		Where("did = ?", did).
+	result := r.db.WithContext(ctx).Model(&models.Repo{}).
+		Where("did = ? AND state = ?", did, models.RepoStateResyncing).
 		Updates(map[string]interface{}{
 			"state":       models.RepoStateActive,
 			"rev":         rev,
@@ -339,8 +370,12 @@ func (r *Resyncer) doResync(ctx context.Context, did string) (bool, error) {
 			"error_msg":   "",
 			"retry_count": 0,
 			"retry_after": 0,
-		}).Error; err != nil {
-		return false, fmt.Errorf("failed to update repo state to active %w", err)
+		})
+	if result.Error != nil {
+		return false, fmt.Errorf("failed to update repo state to active %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return false, errResyncStateChanged
 	}
 
 	r.logger.Info("resync repo complete", "did", did, "rev", rev)
@@ -350,9 +385,13 @@ func (r *Resyncer) doResync(ctx context.Context, did string) (bool, error) {
 func (r *Resyncer) handleResyncError(ctx context.Context, did string, resyncErr error) error {
 	var state models.RepoState
 	var errMsg string
+	terminal := isTerminalResyncError(resyncErr)
 	if resyncErr == nil {
 		state = models.RepoStateDesynchronized
 		errMsg = ""
+	} else if terminal {
+		state = models.RepoStateTerminal
+		errMsg = resyncErr.Error()
 	} else {
 		state = models.RepoStateError
 		errMsg = resyncErr.Error()
@@ -362,19 +401,35 @@ func (r *Resyncer) handleResyncError(ctx context.Context, did string, resyncErr 
 	if err != nil {
 		return err
 	}
+	if repo == nil {
+		if resyncErr != nil {
+			return errors.Join(resyncErr, errResyncStateChanged)
+		}
+		return errResyncStateChanged
+	}
 
-	// start a 1 min & go up to 1 hr between retries
-	retryAfter := time.Now().Add(backoff(repo.RetryCount, 60) * 60)
+	retryAfter := int64(0)
+	if !terminal {
+		// start at 1 minute and go up to 1 hour between retries
+		retryAfter = time.Now().Add(backoff(repo.RetryCount, 60) * 60).Unix()
+	}
 
-	if err := r.db.WithContext(ctx).Model(&models.Repo{}).
-		Where("did = ?", did).
+	result := r.db.WithContext(ctx).Model(&models.Repo{}).
+		Where("did = ? AND state = ?", did, models.RepoStateResyncing).
 		Updates(map[string]interface{}{
 			"state":       state,
 			"error_msg":   errMsg,
 			"retry_count": repo.RetryCount + 1,
-			"retry_after": retryAfter.Unix(),
-		}).Error; err != nil {
-		return err
+			"retry_after": retryAfter,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		if resyncErr != nil {
+			return errors.Join(resyncErr, errResyncStateChanged)
+		}
+		return errResyncStateChanged
 	}
 	return resyncErr
 

@@ -38,9 +38,23 @@ func (rm *RepoManager) GetRepoState(ctx context.Context, did string) (*models.Re
 }
 
 func (rm *RepoManager) UpdateRepoState(ctx context.Context, did string, state models.RepoState) error {
+	query := rm.db.WithContext(ctx).Model(&models.Repo{}).Where("did = ?", did)
+	if state != models.RepoStateTerminal {
+		query = query.Where("state <> ?", models.RepoStateTerminal)
+	}
+	return query.
+		Update("state", state).Error
+}
+
+func (rm *RepoManager) MarkRepoTerminal(ctx context.Context, did string, cause error) error {
 	return rm.db.WithContext(ctx).Model(&models.Repo{}).
 		Where("did = ?", did).
-		Update("state", state).Error
+		Updates(map[string]interface{}{
+			"state":       models.RepoStateTerminal,
+			"error_msg":   cause.Error(),
+			"retry_count": gorm.Expr("retry_count + 1"),
+			"retry_after": 0,
+		}).Error
 }
 
 // RefreshIdentity fetches the latest identity information for a DID.

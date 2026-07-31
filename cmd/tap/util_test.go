@@ -69,3 +69,12 @@ func TestRunPeriodicallyReturnsOnContextCancel(t *testing.T) {
 		t.Fatal("runPeriodically did not return on context cancel")
 	}
 }
+
+func TestBackoffCapsWithoutOverflow(t *testing.T) {
+	for _, retries := range []int{4, 63, 1000} {
+		duration := backoff(retries, 10)
+		if duration < 10*time.Second || duration >= 11*time.Second {
+			t.Fatalf("expected capped backoff for %d retries, got %s", retries, duration)
+		}
+	}
+}

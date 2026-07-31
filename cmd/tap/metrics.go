@@ -64,6 +64,34 @@ var (
 		Name: "tap_events_acked_total",
 		Help: "Total number of events acknowledged",
 	})
+	eventsDeadLettered = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "tap_events_dead_lettered_total",
+		Help: "Total number of events durably moved to the webhook dead-letter queue",
+	})
+	deadLetterDepth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "tap_outbox_dead_letter_depth",
+		Help: "Number of webhook events currently awaiting dead-letter requeue",
+	})
+	deadLetterRows = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "tap_outbox_dead_letter_rows",
+		Help: "Total durable dead-letter rows, including compacted requeue receipts",
+	})
+	deadLetterRetainedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "tap_outbox_dead_letter_retained_body_bytes",
+		Help: "Bytes of JSON bodies still retained in active dead-letter rows",
+	})
+	deadLetterRequeueSuccesses = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "tap_outbox_dead_letter_requeue_success_total",
+		Help: "Total successful dead-letter requeue requests",
+	})
+	deadLetterRequeueFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "tap_outbox_dead_letter_requeue_failure_total",
+		Help: "Total failed dead-letter requeue requests by bounded category",
+	}, []string{"category"})
+	deadLetterPersistenceFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "tap_outbox_dead_letter_persistence_failure_total",
+		Help: "Total failed dead-letter persistence attempts by bounded category",
+	}, []string{"category"})
 	webhookRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "tap_webhook_requests_total",
 		Help: "Total webhook requests by status",

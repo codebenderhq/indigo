@@ -62,8 +62,10 @@ Tips:
 - `GET /stats/repo-count`: get total number of tracked repos
 - `GET /stats/record-count`: get total number of tracked records
 - `GET /stats/outbox-buffer`: get number of events in outbox buffer
+- `GET /stats/outbox-dead-letter`: get number of durably dead-lettered webhook events awaiting requeue
 - `GET /stats/resync-buffer`: get number of events in resync buffer
 - `GET /stats/cursors`: get current firehose and list repos cursors
+- `POST /outbox/dead-letters/:id/requeue`: atomically restore a dead-lettered event for delivery
 
 If more than one client connects to the WebSocket, events will be transparently sharded across all connected clients. There are no guarantees around sharding, events are delivered to an any available websocket consumer. Though the general deliverability guarantees (as described in *Per-Repo Ordering Rules*) hold across shards.
 
@@ -72,18 +74,21 @@ If more than one client connects to the WebSocket, events will be transparently 
 Environment variables or CLI flags:
 
 - `TAP_DATABASE_URL`: database connection string, SQLite or PostgreSQL (default: `sqlite://./tap.db`)
-- `TAP_MAX_DB_CONNS`: maximum number of database connections (default: `32`)
+- `TAP_MAX_DB_CONNS`: maximum number of database connections (default: `32`, maximum: `1024`)
 - `TAP_BIND`: HTTP server address (default: `:2480`)
-- `TAP_PLC_URL`: PLC directory HTTP/HTTPS URL (default: `https://plc.directory`)
+- `TAP_PLC_URL`: pathless HTTPS PLC directory origin (default: `https://plc.directory`)
 - `TAP_RELAY_URL`: AT Protocol relay HTTP/HTTPS URL (default: `https://relay1.us-east.bsky.network`)
-- `TAP_FIREHOSE_PARALLELISM`: concurrent firehose event processors (default: `10`)
-- `TAP_RESYNC_PARALLELISM`: concurrent resync workers (default: `5`)
-- `TAP_OUTBOX_PARALLELISM`: concurrent outbox workers (default: `1`)
+- `TAP_FIREHOSE_PARALLELISM`: concurrent firehose event processors (default: `10`, maximum: `1024`)
+- `TAP_RESYNC_PARALLELISM`: concurrent resync workers (fixed at `1`)
+- `TAP_OUTBOX_PARALLELISM`: concurrent outbox acknowledgement workers (default: `1`, maximum: `128`)
 - `TAP_CURSOR_SAVE_INTERVAL`: how often to persist upstream firehose cursor (default: `1s`)
 - `TAP_NO_REPLAY`: skip saved cursor and connect to firehose head on startup; incompatible with `TAP_FULL_NETWORK`, not recommended for production (default: `false`)
 - `TAP_REPO_FETCH_TIMEOUT`: timeout for fetching repo CARs from PDS (default: `300s`)
-- `TAP_IDENT_CACHE_SIZE`: size of in-process identity cache (default: `2000000`)
-- `TAP_OUTBOX_CAPACITY`: rough size of outbox before back pressure is applied (default: `100000`)
+- `TAP_IDENTITY_MAX_BYTES`: maximum identity, DID, or PLC response size in bytes (default: `1048576`, maximum: `16777216`)
+- `TAP_REPO_MAX_BYTES`: maximum PDS repo CAR response size in bytes (default: `67108864`, maximum: `536870912`)
+- `TAP_REPO_MAX_BLOCKS`: maximum number of blocks in a PDS repo CAR (default: `100000`, maximum: `500000`)
+- `TAP_IDENT_CACHE_SIZE`: size of in-process identity cache (default: `2000000`, maximum: `10000000`)
+- `TAP_OUTBOX_CAPACITY`: rough size of outbox before back pressure is applied (default: `100000`, maximum: `10000000`)
 - `TAP_FULL_NETWORK`: track all repos on the network (default: `false`)
 - `TAP_SIGNAL_COLLECTION`: track all repos with at least one record in this collection (e.g. `app.bsky.actor.profile`)
 - `TAP_COLLECTION_FILTERS`: comma-separated collection filters, wildcards accepted (e.g., `app.bsky.feed.post,app.bsky.graph.*`)
@@ -103,7 +108,7 @@ Tap supports three delivery modes:
 
 **Fire-and-forget**: Set `TAP_DISABLE_ACKS=true`. Events are sent and considered "acked" once the client receives them. Simpler but may result in data loss. Recommended for testing purposes or when data integrity is not critical.
 
-**Webhook**: Set `TAP_WEBHOOK_URL=http://...`. Events are POSTed as JSON. Events considered "acked" once the webhook responds with a 200. Recommended for lower throughput serverless environments.
+**Webhook**: Set `TAP_WEBHOOK_URL=http://...`. Events are POSTed as JSON. Events are considered "acked" after a 2xx response. A 413 response is terminal only when it also includes `x-worklyn-tap-outcome: dead-letter` and `x-worklyn-tap-reason: payload-too-large`; Tap then moves the exact event to its durable dead-letter table. Other failures remain retryable. Requeue retains immutable metadata and the digest in a compact receipt while removing the duplicate JSON body and active dead-letter depth; there is no online delete endpoint. Events over 3 MiB cannot be requeued by this build. Recommended for lower throughput serverless environments.
 
 
 ## Network Boundary Modes
@@ -220,9 +225,9 @@ When using webhook mode, Tap sends the same Basic auth credentials to your webho
 
 Tap logs to stdout in JSON format. The firehose consumer automatically reconnects with exponential backoff on relay failures. Cursor position is saved periodically (default 1 second) and restored on restart.
 
-SQLite is tuned for high write throughput: WAL mode, 10-second busy timeout, `synchronous=NORMAL`, 64MB cache, batched deletes. The outbox buffers up to 1M pending events in memory.
+SQLite is tuned for high write throughput: WAL mode, 10-second busy timeout, `synchronous=NORMAL`, 64MB cache, and batched deletes. Loaded, new, and requeued events all enter the same generation-aware per-DID dispatcher. Failed or ambiguously committed acknowledgement-deletion batches are retained and retried with bounded backoff. Dead-letter metrics expose active depth, total durable rows, and retained JSON-body bytes.
 
-Resync is automatic: if a commit does not validate according to [Sync v1.1](https://github.com/bluesky-social/proposals/tree/main/0006-sync-iteration) semantics, the repo is marked `desyncrhonized` until it can be refetched from the authoritative PDS. Live events during resync are buffered and replayed after completion. Failures trigger exponential backoff (1 minute → 1 hour max).
+Resync is automatic: if a commit does not validate according to [Sync v1.1](https://github.com/bluesky-social/proposals/tree/main/0006-sync-iteration) semantics, the repo is marked `desyncrhonized` until it can be refetched from the authoritative PDS. Live events during resync are buffered and replayed after completion. Failures trigger exponential backoff (1 minute → 1 hour max). Repo CARs are streamed to bounded, immediately unlinked temporary files and preflighted for block count before context-aware parsing. Identity or repo responses over the configured byte limits, and CARs over the block limit, put the repo in an absorbing terminal state; the same applies when an oversized identity response is encountered during firehose verification. The global cursor may advance past that poison event. Removing and re-adding the DID explicitly retries the repo.
 
 Identity resolution uses a cached directory (24-hour TTL). DNS lookups are skipped for `*.bsky.social` handles. The cache warms up at startup and may cause a burst of PLC directory requests.
 

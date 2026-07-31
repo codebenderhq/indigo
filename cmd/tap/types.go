@@ -72,10 +72,18 @@ type MarshallableEvt struct {
 }
 
 type OutboxEvt struct {
-	ID    uint
-	Did   string
-	Live  bool
-	Event []byte
+	ID         uint
+	Did        string
+	Live       bool
+	Event      []byte
+	Generation uint64
+}
+
+type outboxAck struct {
+	ID         uint
+	Generation uint64
+	Did        string
+	SHA256     string
 }
 
 type WsReponseType string

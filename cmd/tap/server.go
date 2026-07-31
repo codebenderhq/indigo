@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 
 	"github.com/bluesky-social/indigo/atproto/auth"
 	"github.com/bluesky-social/indigo/atproto/identity"
@@ -28,19 +31,16 @@ type TapServer struct {
 }
 
 func NewTapServer(logger *slog.Logger, db *gorm.DB, outbox *Outbox, idDir identity.Directory, firehose *FirehoseProcessor, crawler *Crawler, config *TapConfig) *TapServer {
-	return &TapServer{
+	ts := &TapServer{
 		logger:        logger.With("component", "server"),
 		db:            db,
+		echo:          echo.New(),
 		outbox:        outbox,
 		adminPassword: config.AdminPassword,
 		idDir:         idDir,
 		firehose:      firehose,
 		crawler:       crawler,
 	}
-}
-
-func (ts *TapServer) Start(address string) error {
-	ts.echo = echo.New()
 	ts.echo.HideBanner = true
 	ts.echo.HidePort = true // silence http server started on [::]:port log line
 	ts.echo.Use(middleware.LoggerWithConfig(middleware.DefaultLoggerConfig))
@@ -61,8 +61,14 @@ func (ts *TapServer) Start(address string) error {
 	ts.echo.GET("/stats/repo-count", ts.handleStatsRepoCount)
 	ts.echo.GET("/stats/record-count", ts.handleStatsRecordCount)
 	ts.echo.GET("/stats/outbox-buffer", ts.handleStatsOutboxBuffer)
+	ts.echo.GET("/stats/outbox-dead-letter", ts.handleStatsOutboxDeadLetter)
 	ts.echo.GET("/stats/resync-buffer", ts.handleStatsResyncBuffer)
 	ts.echo.GET("/stats/cursors", ts.handleStatsCursors)
+	ts.echo.POST("/outbox/dead-letters/:id/requeue", ts.handleRequeueDeadLetter)
+	return ts
+}
+
+func (ts *TapServer) Start(address string) error {
 	return ts.echo.Start(address)
 }
 
@@ -108,7 +114,7 @@ func (ts *TapServer) handleChannelWebsocket(c echo.Context) error {
 			}
 
 			if ts.outbox.mode == OutboxModeWebsocketAck && msg.Type == WsResponseAck {
-				go ts.outbox.AckEvent(msg.ID)
+				ts.outbox.AckEvent(msg.ID)
 			}
 		}
 	}()
@@ -129,7 +135,7 @@ func (ts *TapServer) handleChannelWebsocket(c echo.Context) error {
 			// In fire-and-forget mode, ack immediately after write succeeds
 			// In websocket-ack mode, wait for client to send ack and handle in read loop
 			if ts.outbox.mode == OutboxModeFireAndForget {
-				go ts.outbox.AckEvent(msg.ID)
+				ts.outbox.AckEvent(msg.ID)
 			}
 		}
 	}
@@ -256,6 +262,37 @@ func (ts *TapServer) handleStatsOutboxBuffer(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get outbox buffer size")
 	}
 	return c.JSON(http.StatusOK, map[string]int64{"outbox_buffer": count})
+}
+
+func (ts *TapServer) handleStatsOutboxDeadLetter(c echo.Context) error {
+	ctx := c.Request().Context()
+	var count int64
+	if err := ts.db.WithContext(ctx).Model(&models.OutboxDeadLetter{}).Where("requeued_at IS NULL").Count(&count).Error; err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to get outbox dead-letter size")
+	}
+	return c.JSON(http.StatusOK, map[string]int64{"outbox_dead_letter": count})
+}
+
+func (ts *TapServer) handleRequeueDeadLetter(c echo.Context) error {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 || id > math.MaxInt64 {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid dead-letter ID")
+	}
+
+	if _, err := ts.outbox.RequeueDeadLetter(c.Request().Context(), uint(id)); err != nil {
+		switch {
+		case errors.Is(err, errDeadLetterNotFound):
+			return echo.NewHTTPError(http.StatusNotFound, "dead letter not found")
+		case errors.Is(err, errActiveEventConflict):
+			return echo.NewHTTPError(http.StatusConflict, "active outbox event ID already exists")
+		case errors.Is(err, errDeadLetterTooLarge):
+			return echo.NewHTTPError(http.StatusConflict, "dead-letter payload exceeds this Tap build's 3 MiB delivery limit")
+		default:
+			ts.logger.Error("failed to requeue dead letter", "id", id, "error", err)
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to requeue dead letter")
+		}
+	}
+	return c.NoContent(http.StatusOK)
 }
 
 func (ts *TapServer) handleStatsResyncBuffer(c echo.Context) error {

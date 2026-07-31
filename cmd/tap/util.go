@@ -22,7 +22,14 @@ func userAgent() string {
 }
 
 func backoff(retries int, max int) time.Duration {
-	dur := 1 << retries
+	dur := 1
+	for i := 0; i < retries && dur < max; i++ {
+		if dur > max/2 {
+			dur = max
+		} else {
+			dur *= 2
+		}
+	}
 	if dur > max {
 		dur = max
 	}
@@ -96,5 +103,16 @@ func runPeriodically(ctx context.Context, interval time.Duration, task func(cont
 				return fmt.Errorf("periodic task failed: %w", err)
 			}
 		}
+	}
+}
+
+func sleepContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }

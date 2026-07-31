@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"time"
 
 	"github.com/bluesky-social/indigo/atproto/identity"
 	"github.com/bluesky-social/indigo/cmd/relay/relay"
@@ -137,12 +138,24 @@ func RunScenario(ctx context.Context, s *Scenario) error {
 		return err
 	}
 
+	// The relay WebSocket connection to the producer is an async goroutine.
+	// Without a settle window, the test producer can push the first messages
+	// before the relay's subscription handshake completes, causing "sending
+	// event, but no subscribers" and a consumer timeout on macOS.
+	time.Sleep(300 * time.Millisecond)
+
 	c := NewConsumer(fmt.Sprintf("ws://localhost:%d", sr.Port))
 	err = c.Connect(ctx, -1)
 	if err != nil {
 		return err
 	}
 	defer c.Shutdown()
+
+	// Flush any events that the consumer may already have buffered from the
+	// relay's backfill of previously subscribed producers before the test
+	// scenario begins sending. This ensures the consumer only observes the
+	// events from the scenario under test, not historical replays.
+	c.Clear()
 
 	for i, msg := range s.Messages {
 		slog.Info("sending test message", "index", i)
